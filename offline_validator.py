@@ -93,6 +93,7 @@ async def main():
                     "field": field,
                     "currentStatus": "invalid",
                     "value": val,
+                    "datatype": validator.field_types.get(field, "STRING").lower(),
                     "validation_status": p.get("validation_status", "invalid"),
                     "mapping": p.get("mapping", "")
                 }
@@ -115,8 +116,9 @@ async def main():
                 meta_list = []
                 for m in p.get("metadata", []):
                     m_clean = dict(m)
-                    m_comparing = []
                     m_name = m_clean.get("name")
+                    m_clean["datatype"] = validator.field_types.get(m_name, "STRING").lower()
+                    m_comparing = []
                     for i, rec_sug in enumerate(record_suggestions, 1):
                         m_comparing.append({
                             f"suggestion{i}": rec_sug["metadata"].get(m_name, ""),
@@ -136,7 +138,7 @@ async def main():
                 "benchmark_category": doc.get("benchmarkCategory"),
                 "data": [{
                     "invalidFields": sorted(list(set(
-                        [p.get("field") for p in clean_meta if p.get("field") and p.get("validation_status") == "invalid"] +
+                        [p.get("field") for p in clean_meta if p.get("validation_status") == "invalid"] +
                         [m.get("name") for p in clean_meta for m in p.get("metadata", []) if m.get("validation_status") == "invalid"]
                     ))),
                     "invalidValues": clean_meta,

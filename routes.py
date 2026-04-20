@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Query, Body, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import List, Dict, Any, Optional
 import time
 import rapidfuzz
 from rapidfuzz import process
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 from database import get_db, MASTERLIST_COL, EXECUTION_INFO_COL, SNAPSHOT_COL
 from validation import build_mappings, get_validator
@@ -15,35 +15,64 @@ router = APIRouter()
 
 
 class ApproveSuggestionRequest(BaseModel):
+    model_config = ConfigDict(extra='allow')
+
     execution_id: str
     field_name: str
     accepted_value: str
     currentStatus: str = "Accepted"
+    coreCount: Optional[str] = None
 
 class RejectRecordRequest(BaseModel):
     execution_id: str
     currentStatus: str = "L0 Data"
 
 class DraftRecordRequest(BaseModel):
+    model_config = ConfigDict(extra='allow')
+
     value: str
     currentStatus: str = "ON HOLD"
     id: Optional[str] = None
     execution_id: Optional[str] = None
+    # Dynamic metadata container
+    metadata: Dict[str, Any] = {}
+    
+    # Keeping named fields for backward compatibility and convenience
     family: Optional[str] = ""
     corecount: Optional[str] = ""
     cpumodel: Optional[str] = ""
     cloudprovider: Optional[str] = ""
     benchmarktype: Optional[str] = ""
 
-# Internal Helpers for Draft Workflows
-async def _check_duplicate(db, type_name, value):
-    """Checks if a record with the same type and value already exists in the masterlist."""
-    return await db[MASTERLIST_COL].find_one({"type": type_name, "data.value": value})
+    def get_merged_metadata(self) -> Dict[str, Any]:
+        """Merges named fields and the generic metadata dict, including extra fields."""
+        data = dict(self.metadata)
+        
+        # Capture all extra fields sent from the UI (e.g. 'Family', 'CPU(s)')
+        if hasattr(self, 'model_extra') and self.model_extra:
+            data.update(self.model_extra)
 
-def _build_base_ml_doc(type_name, data_content, updated_by: str = ""):
+        # Only add named fields if they aren't already in the metadata dict and aren't empty
+        if self.family and "Family" not in data: data["Family"] = self.family
+        if self.corecount and "coreCount" not in data: data["coreCount"] = self.corecount
+        if self.cpumodel and "CPUModel" not in data: data["CPUModel"] = self.cpumodel
+        if self.cloudprovider and "cloudProvider" not in data: data["cloudProvider"] = self.cloudprovider
+        if self.benchmarktype and "BenchmarkType" not in data: data["BenchmarkType"] = self.benchmarktype
+        return data
+
+# Internal Helpers for Draft Workflows
+async def _check_duplicate(db, type_name, value, metadata_filters: Dict[str, Any] = None):
+    """Checks if a record with the same type and value (and optional metadata) already exists."""
+    query = {"type": type_name, "data.value": value}
+    if metadata_filters:
+        for k, v in metadata_filters.items():
+            query[f"data.metadata.{k}"] = v
+    return await db[MASTERLIST_COL].find_one(query)
+
+def _build_base_ml_doc(type_name, data_content, updated_by: str = "", execution_id: str = None):
     """Builds the common base structure for a 'In Review' masterlist document with data before history."""
     now = datetime.utcnow()
-    return {
+    doc = {
         "`_id`": str(uuid.uuid4()),
         "type": type_name,
         "status": "Draft",
@@ -55,29 +84,62 @@ def _build_base_ml_doc(type_name, data_content, updated_by: str = ""):
             "valueField": None
         }
     }
+    if execution_id:
+        doc["execution_id"] = execution_id
+    return doc
 
 async def resolve_fuzzy_benchmarks(benchmarkType: str = None, benchmarkCategory: str = None):
     """
     Fuzzy match across masterlist published records to find the standard BenchmarkType/Category.
-    Returns resolved values based on high-confidence fuzzy matching scores (>70).
+    Now dynamic: identifying relevant types and paths from the masterlist structure.
     """
     db = get_db()
-    cursor = db[MASTERLIST_COL].find({"type": "Benchmark", "status": "Published"})
+    field_map = await _get_dynamic_field_map(db)
+    
+    # Find record types that deal with benchmarks
+    benchmark_data_types = set()
+    for key, info in field_map.items():
+        if "benchmark" in key:
+            benchmark_data_types.add(info["type"])
+            
+    # Fetch all relevant benchmark records
+    cursor = db[MASTERLIST_COL].find({
+        "type": {"$in": list(benchmark_data_types)}, 
+        "status": "Published"
+    })
     benchmarks = await cursor.to_list(None)
     
     resolved = {}
     if benchmarkType:
-        # Match against metadata.BenchmarkType or data.value (category) or the type itself
-        all_types = list(set([b["data"].get("metadata", {}).get("BenchmarkType") for b in benchmarks if b["data"].get("metadata", {}).get("BenchmarkType")]))
-        if all_types:
-            best = rapidfuzz.process.extractOne(benchmarkType, all_types, score_cutoff=70)
+        # Collect potential benchmark names from both primary values and metadata
+        potential_names = []
+        for b in benchmarks:
+            data = b.get("data", {})
+            # Check primary value
+            if data.get("value"): potential_names.append(data["value"])
+            # Check all metadata
+            for m_val in data.get("metadata", {}).values():
+                if isinstance(m_val, str) and m_val: potential_names.append(m_val)
+        
+        all_names = list(set(potential_names))
+        if all_names:
+            best = rapidfuzz.process.extractOne(benchmarkType, all_names, score_cutoff=70)
             if best:
                 resolved["benchmarkType"] = best[0]
                 resolved["benchmarkType_is_fuzzy"] = True
                 
     if benchmarkCategory:
-        # Match against primary data.value (which is the grouping category for Benchmark type)
-        all_categories = list(set([b["data"].get("value") for b in benchmarks if b["data"].get("value")]))
+        # Similarly collect potential category names
+        potential_cats = []
+        for b in benchmarks:
+            data = b.get("data", {})
+            # Check metadata or value for anything matching 'category'
+            for k, v in data.get("metadata", {}).items():
+                if "category" in k.lower() and v: potential_cats.append(v)
+            if "category" in b.get("type", "").lower() and data.get("value"):
+                potential_cats.append(data["value"])
+                
+        all_categories = list(set(potential_cats))
         if all_categories:
             best = rapidfuzz.process.extractOne(benchmarkCategory, all_categories, score_cutoff=70)
             if best:
@@ -107,20 +169,149 @@ async def get_masterlist_mappings(field_type: str):
         "metadata_mappings": meta_mappings
     }
 
-# Lookup table for field names per record type
-_DRAFT_FIELDS_MAP = {
-    "cpumodel": ["value", "family", "corecount"],
-    "instancetype": ["value", "cpumodel", "cloudprovider", "family", "corecount"],
-    "benchmark": ["value", "benchmarktype"]
-}
-
 # Global in-memory cache for expensive dashboard queries
 _report_cache = {
     "total_invalid": {"value": None, "updated_at": 0},
     "counts_metrics": {"value": None, "updated_at": 0},
     "summary_counts": {"value": None, "updated_at": 0}
 }
+_discovery_cache = {"field_map": None, "updated_at": 0}
 CACHE_TTL = 300  # 5 minutes
+
+async def _get_dynamic_field_map(db) -> Dict[str, Dict[str, Any]]:
+    """
+    Scans the masterlist to build a map of every field name (primary or metadata)
+    to its actual database location and the record type it belongs to.
+    """
+    import time
+    now = time.time()
+    if _discovery_cache["field_map"] and (now - _discovery_cache["updated_at"] < CACHE_TTL):
+        return _discovery_cache["field_map"]
+        
+    field_map = {}
+    all_types = await db[MASTERLIST_COL].distinct("type", {"status": "Published"})
+    
+    for t in all_types:
+        sample = await db[MASTERLIST_COL].find_one({"type": t, "status": "Published"})
+        if not sample: continue
+        
+        data = sample.get("data", {})
+        # 1. Primary field mapping (the unique 'value' of this type)
+        t_norm = t.lower()
+        # Always prioritize primary definitions
+        field_map[t_norm] = {"type": t, "path": "data.value", "is_primary": True}
+            
+        # 2. Metadata fields
+        metadata = data.get("metadata", {})
+        if isinstance(metadata, dict):
+            for k in metadata.keys():
+                if k.startswith("mapping_"): continue
+                k_norm = k.lower()
+                # Do NOT overwrite a primary definition with a metadata location
+                if k_norm not in field_map or not field_map[k_norm]["is_primary"]:
+                    field_map[k_norm] = {"type": t, "path": f"data.metadata.{k}", "is_primary": False}
+                
+    _discovery_cache["field_map"] = field_map
+    _discovery_cache["updated_at"] = now
+    return field_map
+
+async def get_dynamic_draft_fields(type_name: str) -> Dict[str, Any]:
+    """
+    Dynamically discovers the schema for a masterlist type by inspecting published records.
+    Returns: {
+        "actual_type": "CPUModel", 
+        "mapping": "...", 
+        "sutType": "...", 
+        "mapping_sutType": "...",
+        "metadata_fields": ["Family", "coreCount"],
+        "metadata_mappings": {"Family": "...", "coreCount": "..."}
+    }
+    """
+    db = get_db()
+    
+    # 1. Resolve actual type name (case-insensitive)
+    all_types = await db[MASTERLIST_COL].distinct("type")
+    actual_type = type_name
+    for t in all_types:
+        if t.lower() == type_name.lower():
+            actual_type = t
+            break
+            
+    # 2. Find a representative published record to use as a template
+    template = await db[MASTERLIST_COL].find_one({"type": actual_type, "status": "Published"})
+    if not template:
+        # Fallback to any record if no published one exists
+        template = await db[MASTERLIST_COL].find_one({"type": actual_type})
+        
+    if not template:
+        return {
+            "actual_type": actual_type,
+            "mapping": "",
+            "metadata_fields": ["value"],
+            "metadata_mappings": {},
+            "field_types": {"value": "string"}
+        }
+        
+    data = template.get("data", {})
+    metadata = data.get("metadata", {})
+    
+    meta_fields = []
+    meta_mappings = {}
+    
+    if isinstance(metadata, dict):
+        for k, v in metadata.items():
+            if k.startswith("mapping_"):
+                field_name = k.replace("mapping_", "")
+                meta_mappings[field_name] = v
+            else:
+                meta_fields.append(k)
+                
+    # Ensure all meta_fields have a mapping in the mappings dict (even if empty)
+    for f in meta_fields:
+        if f not in meta_mappings:
+            meta_mappings[f] = metadata.get(f"mapping_{f}", "")
+
+    # 3. Detect Datatypes for all discovered fields
+    # We scan a sample of up to 10 published records of this type to determine native DB types.
+    all_target_fields = ["value"] + meta_fields
+    
+    # Track sets of Python types encountered for each field
+    field_actual_types = {f: set() for f in all_target_fields}
+    
+    sample_cursor = db[MASTERLIST_COL].find({"type": actual_type, "status": "Published"}).limit(10)
+    async for sample_doc in sample_cursor:
+        s_data = sample_doc.get("data", {})
+        s_meta = s_data.get("metadata", {})
+        
+        for f in all_target_fields:
+            val = s_data.get("value") if f == "value" else s_meta.get(f)
+            
+            # Record type if value is not effectively empty
+            if val is not None and str(val).strip() != "":
+                field_actual_types[f].add(type(val))
+                    
+    # Finalize types based on encountered Python classes
+    field_types = {}
+    for f in all_target_fields:
+        types = field_actual_types[f]
+        if not types:
+            field_types[f] = "string" # Default
+        elif str in types:
+            field_types[f] = "string" # If it's a string in DB, it's 'string'
+        elif int in types or float in types:
+            field_types[f] = "integer" # If it's pure numeric in DB, it's 'integer'
+        else:
+            field_types[f] = "string"
+                    
+    return {
+        "actual_type": actual_type,
+        "mapping": data.get("mapping", ""),
+        "sutType": data.get("sutType"),
+        "mapping_sutType": data.get("mapping_sutType"),
+        "metadata_fields": all_target_fields,
+        "metadata_mappings": meta_mappings,
+        "field_types": field_types
+    }
 
 @router.get("/invalid-records")
 async def get_invalid_records(
@@ -193,7 +384,15 @@ async def get_invalid_records(
     invalid_records = []
     async for doc in db[EXECUTION_INFO_COL].aggregate(pipeline):
         invalid_payloads = doc.get("invalidPayload", [])
-        invalid_fields = [p.get("field") for p in invalid_payloads if p.get("field")]
+        invalid_fields = set()
+        for p in invalid_payloads:
+            if p.get("validation_status") == "invalid":
+                invalid_fields.add(p.get("field"))
+            for m in p.get("metadata", []):
+                if m.get("validation_status") == "invalid":
+                    invalid_fields.add(m.get("name"))
+        
+        invalid_fields = sorted(list(invalid_fields))
         
         record = {
             "ExecutionId": doc["_id"],
@@ -258,31 +457,38 @@ async def get_invalid_summary_counts():
     counts = {"red": 0, "yellow": 0, "green": 0}
     now = datetime.utcnow()
     
-    # Query all PENDING snapshots (Case-insensitive) to evaluate their age
-    cursor = db[SNAPSHOT_COL].find(
-        {"data.0.standardization_status": {"$regex": "^PENDING$", "$options": "i"}},
-        {"data": {"$slice": 1}}
-    )
-    
-    async for doc in cursor:
-        updated_on_str = doc.get("data", [{}])[0].get("history", {}).get("updatedOn")
-        if not updated_on_str:
-            continue
-            
-        try:
-            # Parse the timestamp e.g. '2026-03-27T15:18:14.632228Z'
-            dt = datetime.strptime(updated_on_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-            delta_days = (now - dt).days
-            
-            if delta_days < 3:
-                counts["green"] += 1
-            elif 3 <= delta_days <= 6:
-                counts["yellow"] += 1
-            else:
-                counts["red"] += 1
-        except Exception:
-            # Fallback for unparseable dates
-            counts["yellow"] += 1
+    count_agg = [
+        {"$match": {"data.0.standardization_status": "PENDING"}},
+        {"$addFields": {
+            "updatedOn": {"$arrayElemAt": ["$data.history.updatedOn", 0]}
+        }},
+        {"$match": {"updatedOn": {"$type": "string"}}},
+        {"$addFields": {
+            "now": now,
+            "dt": {"$dateFromString": {"dateString": "$updatedOn", "onError": None}}
+        }},
+        {"$match": {"dt": {"$ne": None}}},
+        {"$addFields": {
+            "diffDays": {
+                "$floor": {
+                    "$divide": [{"$subtract": ["$now", "$dt"]}, 86400000]
+                }
+            }
+        }},
+        {"$group": {
+            "_id": {
+                "$cond": [
+                    {"$lt": ["$diffDays", 3]}, "green",
+                    {"$cond": [{"$lt": ["$diffDays", 6]}, "yellow", "red"]}
+                ]
+            },
+            "count": {"$sum": 1}
+        }}
+    ]
+
+    async for result_doc in db[SNAPSHOT_COL].aggregate(count_agg):
+        if result_doc["_id"] in counts:
+            counts[result_doc["_id"]] = result_doc["count"]
     
     _report_cache["summary_counts"]["value"] = counts
     _report_cache["summary_counts"]["updated_at"] = time.time()
@@ -292,6 +498,7 @@ async def get_invalid_summary_counts():
 async def get_invalid_summary(
     search: Optional[str] = Query(None, description="Search by Execution ID, Benchmark Type, or Category"),
     status: Optional[str] = Query(None, description="Filter by status: PENDING, REJECTED, ACCEPTED, 'On Hold'. Defaults to ALL if not provided."),
+    age: Optional[str] = Query(None, description="Filter by age: green, yellow, or red"),
     page: int = Query(1, ge=1), 
     size: int = Query(50, ge=1, le=500)
 ):
@@ -303,12 +510,31 @@ async def get_invalid_summary(
     
     # 1. Primary Filter on Snapshot collection
     if status:
-        status_filter = status.upper()
-        match_query = {"data.standardization_status": {"$regex": f"^{status_filter}$", "$options": "i"}}
+        status_list = [s.strip().upper() for s in status.split(",")]
+        if len(status_list) > 1:
+            status_filter = ",".join(status_list) # For internal reporting/cache checks
+            match_query = {"data.standardization_status": {"$in": status_list}}
+        else:
+            status_filter = status_list[0]
+            match_query = {"data.standardization_status": status_filter}
     else:
         # Default: Include all high-level statuses
         status_filter = "ALL"
         match_query = {"data.standardization_status": {"$in": ["PENDING", "REJECTED", "ON HOLD", "ACCEPTED"]}}
+    
+    # 2. Age Filter (Green < 3d, Yellow 3-6d, Red > 6d)
+    if age:
+        now = datetime.utcnow()
+        green_threshold = (now - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        yellow_threshold = (now - timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        
+        # MongoDB handles array-based range queries: data.history.updatedOn is effectively current-record timestamp
+        if age.lower() == "green":
+            match_query["data.history.updatedOn"] = {"$gte": green_threshold}
+        elif age.lower() == "yellow":
+            match_query["data.history.updatedOn"] = {"$lt": green_threshold, "$gte": yellow_threshold}
+        elif age.lower() == "red":
+            match_query["data.history.updatedOn"] = {"$lt": yellow_threshold}
     
     print(f"API Executing Match Query: {match_query}")
     
@@ -358,11 +584,42 @@ async def get_invalid_summary(
     
     cursor = db[SNAPSHOT_COL].aggregate(pipeline)
     
+    # Pre-fetch validator for suggestions check
+    validator = await get_validator()
+    
     async for doc in cursor:
         data_arr = doc.get("data", [{}])
         first_data = data_arr[0] if data_arr else {}
         exec_info = doc.get("exec_info") or {}
         
+        # Collect invalid fields: primary fields + metadata fields that are invalid
+        invalid_fields_list = []
+        any_record_suggestions = False
+        
+        for val_item in first_data.get("invalidValues", []):
+            p_field = val_item.get("field")
+            is_p_invalid = (val_item.get("validation_status") == "invalid")
+            
+            if is_p_invalid:
+                invalid_fields_list.append(p_field)
+            
+            # Check for suggestions in comparingData (primary or metadata level)
+            if not any_record_suggestions:
+                # Primary field suggestions
+                if val_item.get("comparingData"):
+                    any_record_suggestions = True
+                else:
+                    # Check metadata suggestions
+                    for m in val_item.get("metadata", []):
+                        if m.get("comparingData"):
+                            any_record_suggestions = True
+                            break
+            
+            # Add invalid metadata names to the list
+            for m in val_item.get("metadata", []):
+                if m.get("validation_status") == "invalid":
+                    invalid_fields_list.append(m.get("name"))
+       
         record = {
             "ExecutionId": doc.get("execution_id"),
             "Status": first_data.get("standardization_status"),
@@ -371,25 +628,16 @@ async def get_invalid_summary(
                               exec_info.get("benchmarkType", "N/A")),
             "BenchmarkCategory": (doc.get("benchmark_category") or 
                                   first_data.get("benchmark_category") or 
-                                  exec_info.get("benchmarkCategory", "N/A"))
+                                  exec_info.get("benchmarkCategory", "N/A")),
+            "InvalidFields": sorted(list(set(invalid_fields_list))),
+            "suggestionsCount": any_record_suggestions, # The single boolean flag for the execution ID
+            "updatedOn": first_data.get("history", {}).get("updatedOn")
         }
-        
-        # Collect all invalid fields: primary fields + metadata fields that are invalid
-        invalid_fields = set()
-        for val_item in first_data.get("invalidValues", []):
-            if val_item.get("validation_status") == "invalid":
-                invalid_fields.add(val_item.get("field"))
-            for meta_item in val_item.get("metadata", []):
-                if meta_item.get("validation_status") == "invalid":
-                    invalid_fields.add(meta_item.get("name"))
-       
-        record["InvalidFields"] = sorted(list(invalid_fields))
-        record["updatedOn"] = first_data.get("history", {}).get("updatedOn")
             
         invalid_records.append(record)
 
     # 3. Total Count Logic
-    if search or status_filter != "PENDING":
+    if search or status_filter != "PENDING" or age:
         total_records = await db[SNAPSHOT_COL].count_documents(match_query)
     else:
         global _report_cache
@@ -397,56 +645,10 @@ async def get_invalid_summary(
             _report_cache["total_invalid"]["value"] = await db[SNAPSHOT_COL].count_documents({"data.standardization_status": "PENDING"})
             _report_cache["total_invalid"]["updated_at"] = time.time()
         total_records = _report_cache["total_invalid"]["value"]
-    
-    # 4. Aging Counts (Red/Yellow/Green)
-    counts = {"red": 0, "yellow": 0, "green": 0}
-    if (search and search.strip()) or status_filter != "ALL":
-        # Dynamic aging counts for the current search or status filter
-        counts = {"red": 0, "yellow": 0, "green": 0}
-        count_agg = [
-            {"$match": match_query},
-            {"$addFields": {
-                # Accessing the first history timestamp safely from the data array
-                "updatedOn": {"$arrayElemAt": ["$data.history.updatedOn", 0]}
-            }},
-            # Ensure the field exists and is a valid string before attempting to parse it as a date
-            {"$match": {"updatedOn": {"$type": "string"}}},
-            {"$addFields": {
-                "now": datetime.utcnow(),
-                "dt": {"$dateFromString": {"dateString": "$updatedOn", "onError": None}}
-            }},
-            # Filter out any records where date parsing failed
-            {"$match": {"dt": {"$ne": None}}},
-            {"$addFields": {
-                "diffDays": {
-                    "$floor": {
-                        "$divide": [{"$subtract": ["$now", "$dt"]}, 86400000]
-                    }
-                }
-            }},
-            {"$group": {
-                "_id": {
-                    "$cond": [
-                        {"$lt": ["$diffDays", 3]}, "green",
-                        {"$cond": [{"$lte": ["$diffDays", 6]}, "yellow", "red"]}
-                    ]
-                },
-                "count": {"$sum": 1}
-            }}
-        ]
-        async for result_doc in db[SNAPSHOT_COL].aggregate(count_agg):
-            if result_doc["_id"] in counts:
-                counts[result_doc["_id"]] = result_doc["count"]
-    else:
-        # Global cached counts for the default view
-        counts = await get_invalid_summary_counts()
         
     return {
         "status": "success",
         "total_invalid_records": total_records,
-        "red": counts["red"],
-        "yellow": counts["yellow"],
-        "green": counts["green"],
         "page": page,
         "size": size,
         "returned_records": len(invalid_records),
@@ -456,22 +658,24 @@ async def get_invalid_summary(
 async def _get_masterlist_all_unique_values(db):
     """
     Helper to fetch all published unique values for all supported parameters (including metadata).
+    Now fully dynamic: uses the discovered field map to locate values.
     """
+    field_map = await _get_dynamic_field_map(db)
     mappings = await build_mappings()
     
-    if "Benchmark" in mappings and "BenchmarkCategory" not in mappings:
-        mappings["BenchmarkCategory"] = mappings["Benchmark"]
-    
+    # We want to return unique values for every field mentioned in our mappings
     all_params = list(mappings.keys())
-    all_types = await db[MASTERLIST_COL].distinct("type", {"status": "Published"})
-    type_set = set(all_types)
     
     unique_data = {}
     for param in all_params:
-        if param == "BenchmarkCategory" or param in type_set:
-            query_type = "Benchmark" if param == "BenchmarkCategory" else param
-            values = await db[MASTERLIST_COL].distinct("data.value", {"type": query_type, "status": "Published"})
+        param_norm = param.lower()
+        info = field_map.get(param_norm)
+        
+        if info:
+            # Use the discovered path (Primary 'data.value' or Metadata 'data.metadata.X')
+            values = await db[MASTERLIST_COL].distinct(info["path"], {"type": info["type"], "status": "Published"})
         else:
+            # Fallback: try to guess the path if not in the map
             values = await db[MASTERLIST_COL].distinct(f"data.metadata.{param}", {"status": "Published"})
             
         # Normalize to string and strip to remove duplicates like 128 and "128" or trailing spaces
@@ -714,6 +918,36 @@ async def get_snapshot_records(Execution_id: str):
             # We no longer delete the snapshot nor return early. We let the function continue
             # so the UI can fetch and display the full history of this Accepted record!
             
+    # Fetch any draft records for this execution to include in the response
+    draft_cursor = db[MASTERLIST_COL].find({"execution_id": Execution_id, "status": "Draft"})
+    draft_records = await draft_cursor.to_list(None)
+    
+    # Create a map for quick lookup: { (type.lower(), value): flattened_draft }
+    draft_map = {}
+    for dr in draft_records:
+        # Construct the flattened structure as requested
+        d_type = dr.get("type", "Unknown")
+        d_data = dr.get("data", {})
+        
+        d_flat = {
+            d_type: d_data.get("value")
+        }
+        
+        # Capture all internal data and metadata into the flattened root
+        for k, v in d_data.items():
+            k_low = k.lower()
+            if k not in ["metadata", "value"] and k_low != "mapping" and "suttype" not in k_low:
+                d_flat[k_low] = v
+        
+        # Flatten metadata fields (e.g., family, corecount)
+        for k, v in d_data.get("metadata", {}).items():
+            if not k.startswith("mapping_"):
+                d_flat[k.lower()] = v
+        
+        # Key by type for precise mapping to invalid fields within this execution
+        d_type = dr.get("type", "").lower()
+        draft_map[d_type] = d_flat
+
     # Fetch mapping and validation details dynamically for EACH individual field
     type_mappings = {}
     data_list = []
@@ -734,6 +968,7 @@ async def get_snapshot_records(Execution_id: str):
         field_existing_data.append({
             "field": field_name,
             "value": val,
+            "datatype": meta.get("datatype", validator.field_types.get(field_name, "STRING").lower()),
             "validation_status": meta.get("validation_status")
         })
         
@@ -741,6 +976,7 @@ async def get_snapshot_records(Execution_id: str):
             field_existing_data.append({
                 "field": support.get("name"),
                 "value": support.get("value"),
+                "datatype": support.get("datatype", validator.field_types.get(support.get("name"), "STRING").lower()),
                 "validation_status": support.get("validation_status")
             })
             
@@ -771,11 +1007,15 @@ async def get_snapshot_records(Execution_id: str):
                 sug_entry[m_name.lower()] = m_val
             field_suggestions.append(sug_entry)
             
+        # 3. Add Draft Record if available for this specific field type
+        field_draft = draft_map.get(field_name.lower())
+            
         data_list.append({
             "invalid_field": field_name,
             "currentStatus": meta.get("currentStatus", "invalid"),
             "existing_data": field_existing_data,
-            "suggestions": field_suggestions
+            "suggestions": field_suggestions,
+            "draft_records": field_draft
         })
     
     # Restructure history into changes array
@@ -783,20 +1023,89 @@ async def get_snapshot_records(Execution_id: str):
     hist_from = raw_history.get("from") or []
     hist_to = raw_history.get("to") or []
     hist_fields = raw_history.get("valueField") or []
+    hist_source = raw_history.get("source") or []
     
     if not isinstance(hist_from, list): hist_from = [hist_from]
     if not isinstance(hist_to, list): hist_to = [hist_to]
     if not isinstance(hist_fields, list): hist_fields = [hist_fields]
+    if not isinstance(hist_source, list): hist_source = [hist_source]
     
-    changes_by_field = {}
+    individual_changes = []
     for idx in range(len(hist_fields)):
         f = hist_fields[idx] if idx < len(hist_fields) else ""
         frm = hist_from[idx] if idx < len(hist_from) else ""
         to = hist_to[idx] if idx < len(hist_to) else ""
-        if f not in changes_by_field:
-            changes_by_field[f] = {"field": f, "from": [], "to": []}
-        changes_by_field[f]["from"].append(frm)
-        changes_by_field[f]["to"].append(to)
+        src = hist_source[idx] if idx < len(hist_source) else ""
+        
+        individual_changes.append({
+            "field": f,
+            "from": frm,
+            "to": to,
+            "source": src
+        })
+        
+    # Build comprehensive dependency mapping for perfect grouping reconstruction
+    field_to_primary_map = {}
+    metadata_dependencies = {}
+    
+    # 1. First Pass: Register all primary fields
+    for meta in item.get("invalidValues", []):
+        p_field = meta.get("field")
+        if p_field:
+            p_lower = p_field.lower()
+            field_to_primary_map[p_lower] = p_field
+            metadata_dependencies[p_lower] = set()
+            
+    # 2. Second Pass: Register metadata fields (avoiding overwriting primary mappings)
+    for meta in item.get("invalidValues", []):
+        p_field = meta.get("field")
+        if p_field:
+            p_lower = p_field.lower()
+            for supp in meta.get("metadata", []):
+                m_name = supp.get("name")
+                if m_name:
+                    m_lower = m_name.lower()
+                    metadata_dependencies[p_lower].add(m_lower)
+                    # Protect primary field grouping: Only map to parent if not already a primary field
+                    if m_lower not in field_to_primary_map:
+                        field_to_primary_map[m_lower] = p_field
+                    
+    # Group changes sequentially, perfectly isolating overlapping names
+    grouped_changes_list = []
+    
+    for change_obj in individual_changes:
+        f_name = change_obj["field"]
+        f_lower = f_name.lower()
+        src = change_obj.get("source", "")
+        
+        is_cascaded = (src == "cascaded")
+        
+        # Robust heuristic fallback for existing snapshot records missing the "cascaded" tag
+        if not is_cascaded and grouped_changes_list:
+            current_primary_lower = grouped_changes_list[-1]["field"].lower()
+            if f_lower in metadata_dependencies.get(current_primary_lower, set()):
+                is_cascaded = True
+                
+        if not is_cascaded:
+            mapped_primary = field_to_primary_map.get(f_lower, f_name)
+            
+            if not grouped_changes_list or grouped_changes_list[-1]["field"] != mapped_primary:
+                grouped_changes_list.append({
+                    "field": mapped_primary,
+                    "changes": []
+                })
+                
+        # Handle case where history explicitly starts with a cascaded tag (failsafe)
+        if not grouped_changes_list:
+            grouped_changes_list.append({
+                "field": field_to_primary_map.get(f_lower, f_name),
+                "changes": []
+            })
+            
+        filtered_change = {"field": change_obj["field"], "from": change_obj["from"], "to": change_obj["to"]}
+        grouped_changes_list[-1]["changes"].append(filtered_change)
+        
+    grouped_history_changes = grouped_changes_list
         
     # Get execution info for detailed response
     sut_type = exec_meta.get("sutInstanceMetadata.sutType") if "sutInstanceMetadata.sutType" in exec_meta else exec_meta.get("sutInstanceMetadata", {}).get("sutType")
@@ -819,7 +1128,7 @@ async def get_snapshot_records(Execution_id: str):
         "history": {
             "updatedOn": raw_history.get("updatedOn"),
             "updatedBy": raw_history.get("updatedBy"),
-            "changes": list(changes_by_field.values())
+            "changes": grouped_history_changes
         }
     }
 
@@ -827,18 +1136,13 @@ async def get_snapshot_records(Execution_id: str):
 async def get_unique_values(parameterName: Optional[str] = Query(None)):
     """
     Fetches unique values for all validated parameters from the masterlist collection.
-    Dynamically discovers all available types including metadata fields.
+    Now fully dynamic: discovers all field paths from the masterlist structure.
     """
     db = get_db()
-    
-    # Dynamically discover all mapping parameters (including metadata)
+    field_map = await _get_dynamic_field_map(db)
     mappings = await build_mappings()
     
-    # Support 'BenchmarkCategory' as an alias for the primary 'Benchmark' type
-    if "Benchmark" in mappings and "BenchmarkCategory" not in mappings:
-        mappings["BenchmarkCategory"] = mappings["Benchmark"]
-    
-    # Build discovery map
+    # Discovery map for checking valid parameters
     all_params = list(mappings.keys())
     param_map = {p.lower(): p for p in all_params}
     
@@ -849,32 +1153,18 @@ async def get_unique_values(parameterName: Optional[str] = Query(None)):
     if parameterName:
         param_norm = parameterName.lower()
         
-        # Explicit mapping for common parameter names
-        # Some are 'types' in masterlist, others are 'metadata' fields
-        mapping_logic = {
-            "cpumodel":          {"type": "CPUModel", "path": "data.value"},
-            "instancetype":      {"type": "instanceType", "path": "data.value"},
-            "benchmarktype":     {"type": "Benchmark", "path": "data.metadata.BenchmarkType"},
-            "benchmarkcategory": {"type": "Benchmark", "path": "data.value"},
-            "family":            {"type": None, "path": "data.metadata.Family"},
-            "corecount":         {"type": None, "path": "data.metadata.coreCount"},
-            "cloudprovider":     {"type": None, "path": "data.metadata.cloudProvider"}
-        }
-        
-        if param_norm in mapping_logic:
-            rule = mapping_logic[param_norm]
-            query = {"status": "Published"}
-            if rule["type"]:
-                query["type"] = rule["type"]
-            
+        # Check if the parameter exists in our dynamic field map
+        if param_norm in field_map:
+            rule = field_map[param_norm]
+            query = {"status": "Published", "type": rule["type"]}
             values = await db[MASTERLIST_COL].distinct(rule["path"], query)
             actual_param = parameterName # Keep user's casing for the response
         else:
-            # Fallback for other potential parameters discovered via mappings
+            # Fallback for parameters not explicitly discovered (should be rare)
             if param_norm not in param_map:
                 return {
                     "status": "error",
-                    "message": f"Invalid parameterName. Supported values: {list(mapping_logic.keys())} or {all_params}"
+                    "message": f"Invalid parameterName. Supported values: {list(field_map.keys())}"
                 }
             
             actual_param = param_map[param_norm]
@@ -1105,6 +1395,43 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
             {"$set": {target_mapping: req.accepted_value}}
         )
     
+    # 4.1 Handle Manual coreCount / CPU(s) Update (Frontend Driven)
+    manual_core_count = req.coreCount
+    manual_field_name = "coreCount"
+    # Fallback to 'CPU(s)' if 'coreCount' is not provided (handles UI change)
+    if manual_core_count is None and hasattr(req, 'model_extra') and req.model_extra:
+        manual_core_count = req.model_extra.get("CPU(s)")
+        if manual_core_count is not None:
+            manual_field_name = "CPU(s)"
+            
+    original_manual_value = "Unknown"
+    manual_update_occurred = False
+        
+    if manual_core_count is not None and str(manual_core_count).strip() not in ["", "string", "None", "null"]:
+        manual_update_occurred = True
+        # A. Update Executioninfo
+        await db[EXECUTION_INFO_COL].update_one(
+            {"benchmarkExecutionID": req.execution_id},
+            {"$set": {"platformProfile.sut.Summary.CPU.CPU(s)": manual_core_count}}
+        )
+        
+        # B. Also update the Snapshot record itself (Status only)
+        # We check both 'coreCount' and 'CPU(s)' field names for maximum compatibility
+        # We preserve the ORIGINAL value in data but mark it as valid
+        for item in invalid_values:
+            if item.get("field") in ["coreCount", "CPU(s)"]:
+                original_manual_value = item.get("value")
+                item["validation_status"] = "valid"
+                # item["value"] = manual_core_count  # NO OVERWRITE: Preserve original detected value
+                break
+            
+            for meta in item.get("metadata", []):
+                if meta.get("name") in ["coreCount", "CPU(s)"]:
+                    original_manual_value = meta.get("value")
+                    meta["validation_status"] = "valid"
+                    # meta["value"] = manual_core_count  # NO OVERWRITE: Preserve original detected value
+                    break
+    
     # 4b. CASCADE: If this is a primary field, apply the same suggestion status to ALL metadata
     is_primary_field = False
     parent_item = None
@@ -1134,6 +1461,10 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
         
         for meta_item in parent_item.get("metadata", []):
             meta_name = meta_item.get("name")
+            
+            # Skip automated cascade for this field if it was manually updated in this request
+            if manual_update_occurred and meta_name == manual_field_name:
+                continue
             meta_original_value = meta_item.get("value")
             meta_accepted_value = None
             meta_comparing = meta_item.get("comparingData", [])
@@ -1153,9 +1484,12 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
                     sug["status"] = "Rejected"
                     
                 # Dynamically fetch the correct metadata value from the database record!
+                # Default to "None" to prevent preserving old invalid datums if missing in the Masterlist
+                meta_accepted_value = "None"
                 for k, v in dropdown_metadata.items():
                     if k.lower() == str(meta_name).lower():
-                        meta_accepted_value = v
+                        if v is not None and str(v).strip() != "":
+                            meta_accepted_value = v
                         break
             
             # Mark metadata as valid (do NOT update the value field in the snapshot)
@@ -1174,7 +1508,7 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
             cascaded_changes.append({
                 "field": meta_name,
                 "from": meta_original_value,
-                "to": meta_accepted_value or meta_original_value
+                "to": meta_accepted_value
             })
     
     # 5. Check for Overall Validity (Standardization Status)
@@ -1207,12 +1541,19 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
     new_field.append(req.field_name)
     new_source.append(value_source)
     
+    # Add Manual coreCount / CPU(s) update to history if it occurred strictly with a valid value
+    if manual_update_occurred:
+        new_from.append(original_manual_value)
+        new_to.append(manual_core_count)
+        new_field.append(manual_field_name)
+        new_source.append("manual_edit")
+    
     # Add cascaded metadata history
     for change in cascaded_changes:
         new_from.append(change["from"])
         new_to.append(change["to"])
         new_field.append(change["field"])
-        new_source.append(value_source)
+        new_source.append("cascaded")
 
     snap_data["history"] = {
         "updatedOn": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
@@ -1392,81 +1733,81 @@ async def get_draft_executions():
 async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
     """
     Unified endpoint to add a new masterlist record to "In Review" status.
-    Handles CPUModel, instanceType, and Benchmark types dynamically.
+    Now fully dynamic: discovers schema and mappings from existing masterlist records.
     """
     db = get_db()
-    type_norm = type_name.lower()
     
-    # 1. Validation & Duplicate Prevention
-    supported_types = list(_DRAFT_FIELDS_MAP.keys())
-    if type_norm not in supported_types:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Unsupported record type: '{type_name}'. Supported types are: {supported_types}"
-        )
-        
+    # 1. Discover Schema and Resolve Actual Type
+    schema = await get_dynamic_draft_fields(type_name)
+    actual_type = schema["actual_type"]
+    
     value = draft.value
     if not value:
         raise HTTPException(status_code=400, detail="The 'value' field is required in the request body.")
         
-    actual_type = "CPUModel" if type_norm == "cpumodel" else ("instanceType" if type_norm == "instancetype" else type_name)
-    existing = await _check_duplicate(db, actual_type, value)
+    # 2. Merge Metadata (Backward Compatible Fields + New metadata dict)
+    incoming_metadata = draft.get_merged_metadata()
+    
+    # 3. Construct Metadata Filters for Composite Uniqueness
+    # We only filter by metadata fields that are actually defined in the schema
+    metadata_filters = {}
+    for f in schema["metadata_fields"]:
+        if f == "value": continue
+        if f in incoming_metadata:
+            metadata_filters[f] = incoming_metadata[f]
+
+    existing = await _check_duplicate(db, actual_type, value, metadata_filters)
     if existing:
+        # Build a descriptive error message showing the combination
+        combination_str = f"'{value}'"
+        if metadata_filters:
+            meta_details = ", ".join([f"{k}: '{v}'" for k, v in metadata_filters.items()])
+            combination_str += f" with metadata ({meta_details})"
+            
         return {
             "status": "error",
-            "message": f"A record for {actual_type} '{value}' already exists in the masterlist (Status: {existing['status']})."
+            "message": f"A record for {actual_type} {combination_str} already exists in the masterlist (Status: {existing['status']})."
         }
         
-    # 2. Build type-specific data content
-    data_content = {}
+    # 4. Build data content dynamically using template structure
+    data_content = {
+        "value": value,
+        "mapping": schema.get("mapping")
+    }
     
-    if type_norm == "cpumodel":
-        data_content = {
-            "sutType": "server",
-            "mapping_sutType": "sutInstanceMetadata.sutType",
-            "value": value,
-            "mapping": "platformProfile.sut.Summary.Server.CPUModel",
-            "metadata": {
-                "Family": draft.family,
-                "mapping_Family": "processor_details.family",
-                "coreCount": draft.corecount,
-                "mapping_coreCount": "platformProfile.sut.Summary.CPU.CPU(s)"
-            }
-        }
-    elif type_norm == "instancetype":
-        data_content = {
-            "sutType": "cloud",
-            "mapping_sutType": "sutInstanceMetadata.sutType",
-            "value": value,
-            "mapping": "sutInstanceMetadata.instanceType",
-            "metadata": {
-                "CPUModel": draft.cpumodel,
-                "mapping_CPUModel": "platformProfile.sut.Summary.Server.CPUModel",
-                "cloudProvider": draft.cloudprovider,
-                "mapping_cloudProvider": "sutInstanceMetadata.cloudProvider",
-                "Family": draft.family,
-                "mapping_Family": "processor_details.family",
-                "coreCount": draft.corecount,
-                "mapping_coreCount": "platformProfile.sut.Summary.CPU.CPU(s)"
-            }
-        }
-    elif type_norm == "benchmark":
-        data_content = {
-            "value": value,
-            "mapping": "benchmarkCategory",
-            "metadata": {
-                "BenchmarkType": draft.benchmarktype,
-                "mapping_benchmarkType": "benchmarkType"
-            }
-        }
+    # Optional sutType info from template
+    if schema.get("sutType"):
+        data_content["sutType"] = schema["sutType"]
+    if schema.get("mapping_sutType"):
+        data_content["mapping_sutType"] = schema["mapping_sutType"]
+    
+    # Populate Metadata
+    metadata_obj = {}
+    for f_name in schema["metadata_fields"]:
+        if f_name == "value": continue
         
-    # 3. Final Document Construction (Type before Status, Data before History)
-    ml_doc = _build_base_ml_doc(actual_type, data_content, "")
+        # Get value from incoming request (Case-insensitive check)
+        # 1. Try exact match (e.g., 'Family')
+        # 2. Try lowercase match (e.g., 'family')
+        f_val = incoming_metadata.get(f_name)
+        if f_val is None:
+            f_val = incoming_metadata.get(f_name.lower(), "")
+            
+        metadata_obj[f_name] = f_val
+        
+        # Get mapping from schema
+        m_path = schema["metadata_mappings"].get(f_name)
+        if m_path:
+            metadata_obj[f"mapping_{f_name}"] = m_path
+            
+    data_content["metadata"] = metadata_obj
+        
+    # 5. Final Document Construction (Type before Status, Data before History)
+    ml_doc = _build_base_ml_doc(actual_type, data_content, "", execution_id=draft.execution_id)
     
     await db[MASTERLIST_COL].insert_one(ml_doc)
     
-    # 4. Place snapshots containing this drafted value "On Hold"
-    # If a specific execution_id was provided, prioritize it
+    # 6. Place snapshots containing this drafted value "On Hold"
     update_filter = {"execution_id": draft.execution_id} if draft.execution_id else {"data.invalidValues.value": value}
     
     await db[SNAPSHOT_COL].update_many(
@@ -1474,7 +1815,8 @@ async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
         {"$set": {
             "data.0.standardization_status": "ON HOLD",
             "data.0.reason": "New Masterlist Draft Record.",
-            "data.0.invalidValues.$[elem].currentStatus": "ON HOLD"
+            "data.0.invalidValues.$[elem].currentStatus": "ON HOLD",
+            "data.0.history.updatedOn": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         }},
         array_filters=[{"elem.field": {"$regex": f"^{actual_type}$", "$options": "i"}}]
     )
@@ -1488,19 +1830,22 @@ async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
     }
 
 @router.get("/draft-records/fields")
-async def get_draft_record_fields(type: str = Query(..., description="Record type: cpumodel, instancetype, benchmark")):
+async def get_draft_record_fields(type: str = Query(..., description="Record type: cpumodel, instancetype, or any other masterlist type")):
     """
-    Returns the list of required field names for a given record type.
-    Pass ?type=cpumodel, ?type=instancetype, or ?type=benchmark.
+    Returns the list of required field names for a given record type by checking the DB.
     """
-    type_lower = type.lower()
-    if type_lower not in _DRAFT_FIELDS_MAP:
-        return {
-            "status": "error",
-            "message": f"Unsupported type: '{type}'. Supported values: {list(_DRAFT_FIELDS_MAP.keys())}"
-        }
+    schema = await get_dynamic_draft_fields(type)
+    
+    # Transform list of strings into list of objects with fieldname and datatype
+    fields_with_types = []
+    for f_name in schema["metadata_fields"]:
+        fields_with_types.append({
+            "fieldname": f_name,
+            "datatype": schema["field_types"].get(f_name, "string")
+        })
+        
     return {
         "status": "success",
-        "type": type_lower,
-        "fields": _DRAFT_FIELDS_MAP[type_lower]
+        "type": schema["actual_type"],
+        "fields": fields_with_types
     }
